@@ -1,0 +1,627 @@
+---
+title: "Boeing Data Science Challenge Problem"
+output: 
+  html_document: 
+    toc: yes
+date: '3/30/23'
+author: "Hyunjoon Rhee"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(tensorflow)
+library(keras)
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(tidytext)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(Matrix)
+library(data.table)
+library(skimr)
+```
+
+# Introduction
+## Project Goal
+
+This dataset contains information on used cars previously sold. 
+
+Predict: Vehicle Trim & Dealer listing price
+
+How?
+Create one model -vehicle trim
+another model - dealer listing price
+
+## What are the variables?
+
+```{r, include = TRUE}
+ucd = read.csv("Training_DataSet.csv") #ucd = usedcardata
+```
+
+```{r}
+skim(ucd)
+```
+
+```{r}
+ucd_validation = read.csv("Test_Dataset.csv")
+skim(ucd_validation)
+```
+
+# Methods
+
+## Data Cleaning
+
+#### Remove unnecessary columns
+Before removing NA, select columns that can be removed
+```{r}
+ucd <- subset(ucd, select = -c(VehType,VehBodystyle,ListingID,SellerCity,SellerState,SellerName,VehSellerNotes,VehColorInt))
+
+# Testing value
+list_ID <- ucd_validation[,1]
+list_ID <- as.data.frame(list_ID)
+ucd_validation <- subset(ucd_validation, select = -c(VehType,VehBodystyle,ListingID,SellerCity,SellerState,SellerName,VehSellerNotes,VehColorInt))
+```
+- VehType, VehBodystyle were removed since each has only one value (SUV, Used)
+- ListingID was removed due to logical irrelevance
+- SellerCity, SellerState, SellerName were removed to keep Zipcode as the only seller information. Also having high unique values gives a high chance of overfitting.
+- VehSellerNotes was removed due to its redundancy with VehFeats and other variables in the data
+- VehColorInt was removed due to its high # of NA in both train and test data (over 10% of the data)
+
+
+#### Fill NA values in Test data
+```{r}
+library(mice)
+# Calculate mean of 'VehMileage'
+mean_mileage <- mean(ucd_validation$VehMileage, na.rm = TRUE)
+# Replace missing values with mean of column
+ucd_validation$VehMileage <- ifelse(is.na(ucd_validation$VehMileage), mean_mileage, ucd_validation$VehMileage)
+missing <- sapply(ucd_validation, function(x) sum(!nzchar(as.character(x))))
+ucd_validation[ucd_validation == ""] <- NA
+missing
+```
+This block of code is for imputation in R.(Filling NA values with the mode)
+Mode was chosen because for categorical values, there methods such as KNN or mean would not work.
+```{r, include=FALSE}
+# Loop through each column in ucd_validation
+for (col in names(ucd_validation)) {
+  # Check if the column has NAs
+  if (sum(is.na(ucd_validation[[col]])) > 0) {
+    # Get the unique values and their frequencies
+    val <- unique(ucd_validation[[col]][!is.na(ucd_validation[[col]])])
+    my_mode <- val[which.max(tabulate(match(ucd_validation[[col]], val)))]
+    print(my_mode)
+    # Replace NAs with the mode
+    ucd_validation[[col]][is.na(ucd_validation[[col]])] <- my_mode
+  }
+}
+```
+
+#### Removing abnormal values including NA
+```{r}
+cat("ucd before removing empty values: ", dim(ucd), '\n')
+#removing na, or empty values
+ucd <- na.omit(ucd)
+ucd <- ucd[apply(ucd, 1, function(x) all(x != "")), ]
+#result
+cat("ucd after removing empty values: ", dim(ucd))
+```
+
+After removing NA values, I removed cells that contained unnecessary special characters such as $#%@&. 
+```{r}
+#Filter abnormal data with special characters like &, $, %, #, @, `, ;
+ucd <- ucd %>% 
+  filter(!(Vehicle_Trim %like% "&|%|\\$|#|@|`|;"))
+```
+
+
+#### VehDriveTrain & VehTransmission column cleaning for both training and testing data
+```{r}
+#VehDriveTrain change
+#change Four wheel drive to 4WD #change Front wheel drive to FWD #change All wheel drive to AWD #change 4x4 to 4X4
+ucd$VehDriveTrain <- gsub("Four Wheel Drive", "4WD", ucd$VehDriveTrain)
+ucd$VehDriveTrain <- gsub("Front Wheel Drive|FRONT-WHEEL DRIVE|Front-wheel Drive", "FWD", ucd$VehDriveTrain)
+ucd$VehDriveTrain <- gsub("All Wheel Drive|All-wheel Drive|ALL WHEEL|AllWheelDrive|ALL-WHEEL DRIVE", "AWD", ucd$VehDriveTrain)
+ucd$VehDriveTrain <- gsub("4x4", "4X4", ucd$VehDriveTrain)
+#Remove rows 
+rows_to_filter_drivetrain <- c('4WD/AWD','ALL-WHEEL DRIVE WITH LOCKING AND LIMITED-SLIP DIFFERENTIAL','2WD')
+#Rows select everything but the filter
+ucd <- ucd[!(ucd$VehDriveTrain %in% rows_to_filter_drivetrain), ]
+
+#Validation data
+ucd_validation$VehDriveTrain <- gsub("Four Wheel Drive", "4WD", ucd_validation$VehDriveTrain)
+ucd_validation$VehDriveTrain <- gsub("Front Wheel Drive|FRONT-WHEEL DRIVE|Front-wheel Drive", "FWD", ucd_validation$VehDriveTrain)
+ucd_validation$VehDriveTrain <- gsub("All Wheel Drive|All-wheel Drive|ALL WHEEL|AllWheelDrive|ALL-WHEEL DRIVE", "AWD", ucd_validation$VehDriveTrain)
+ucd_validation$VehDriveTrain <- gsub("4x4", "4X4", ucd_validation$VehDriveTrain)
+```
+
+
+```{r}
+#VehTransmission change
+#change AUTOMATIC to Automatic #change Automatic 8-Speed & 8-Speed A/T & 8 Speed Automatic & Automatic, 8-Spd & 8 speed automatic & 8-SPEED AUTOMATIC to 8-Speed Automatic
+ucd$VehTransmission <- gsub("AUTOMATIC|A|Automatic Transmission","Automatic", ucd$VehTransmission)
+ucd$VehTransmission <- gsub("Automatic 8-Speed|8-Speed A/T|8 Speed Automatic|Automatic, 8-Spd|8 speed automatic|8-SPEED AUTOMATIC|8-SPEED Automatic|8-SPEED A/T|8-speed Automatic|8 Spd Automatic","8-Speed Automatic", ucd$VehTransmission)
+#Remove rows
+count_T <- table(ucd$VehTransmission)
+df_count_T <- count_T %>%                 
+  as.data.frame() %>% 
+  arrange(desc(Freq))
+freq1_T <- filter(df_count_T, Freq <= 2)
+rows_to_filter_Transmission <- c(freq1_T$Var1)
+# filter rows that contain any of the specified characters
+ucd <- ucd[!(ucd$VehTransmission %in% rows_to_filter_Transmission), ]
+
+
+# Validation data
+ucd_validation$VehTransmission <- gsub("AUTOMATIC|A|Automatic Transmission","Automatic", ucd_validation$VehTransmission)
+ucd_validation$VehTransmission <- gsub("Automatic 8-Speed|8-Speed A/T|8 Speed Automatic|Automatic, 8-Spd|8 speed automatic|8-SPEED AUTOMATIC|8-SPEED Automatic|8-SPEED A/T|8-speed Automatic|8 Spd Automatic","8-Speed Automatic", ucd_validation$VehTransmission)
+```
+
+
+```{r}
+skim(ucd)
+```
+
+Among the list there are columns that we need to extract text values in a form that we can utilize.
+1. Columns not to worry parsing(use factors to assign value):
+- "SellerListSrc"
+- "VehDriveTrain"
+- "VehFuel"
+- "VehMake"
+- "VehModel"
+- "VehPriceLabel" 
+- "VehTransmission"
+- "Vehicle_Trim"
+
+2. Word
+- "VehColorExt"
+- "VehEngine"
+
+Word refers to column values that should focus on specific words. For example, in VehColorExt column, color values could be better utilized when they are sorted out to specific colors that we desire to see. 
+ex) Diamond Black Crystal Pearlcoat --> 'Black'
+Collecting the key color from this description which is going to be one of the common colors 'Black' would be useful in training and predicting.
+
+3. Phrase
+- "VehFeats"
+- "VehHistory"
+
+Phrase refers to column values that should be parsed into phrases. For example, in VehFeats, it is crucial to separate the key features that the vehicle has.
+ex) ['4-Wheel Disc Brakes', 'ABS', 'Adjustable Steering Wheel', 'Aluminum Wheels', 'AM/FM Stereo', 'Automatic Headlights', 'Auxiliary Audio Input'] --> 4-Wheel Disc Breaks, ABS, Adjustable Steering Wheel ...
+Collecting the key features would be crucial to the model training.
+
+
+## Data Preprocessing
+
+#### Categorical Values Manual Preprocessing with Bag of Words & Concept of Multi-encoding
+In order to utilize the word and phrase data as much as possible, sorting out certain words and phrases that appear often is going to be crucial.
+The following function parse_list, parse_row_w_space, parse_row_wo_space, and encode_row was written in order to parse the value and assign a value to encode categorical data into numbers. 
+
+##### Bag of words
+Bag of words is a concept that gives count to a most appearing words in the text. Using the count, I have counted the most used features or histories of the used car.
+https://www.codecademy.com/learn/dscp-natural-language-processing/modules/dscp-bag-of-words/cheatsheet
+To make the sorting process with better accuracy, I am only going to use variables that has more than 100 counts.
+In order to assign values, I have normalized the values of the top 100 counts. (0~1)
+
+```{r}
+parse_list <- function(x) {
+  x <- gsub("^\\[|\\]$", "", x)
+  elements <- strsplit(x, ", ")[[1]]
+  elements <- gsub("'", "", elements) # remove apostrophes
+  #elements <- gsub("*", "", elements) # remove apostrophes
+  counts <- table(elements)
+  data.frame(word = names(counts), count = as.numeric(counts), stringsAsFactors = FALSE)
+}
+
+parse_row_w_space <- function(row) {
+  # Remove brackets and split by comma
+  elements <- strsplit(gsub("^\\[|\\]$", "", row), ",")[[1]]
+  elements <- strsplit(gsub("^\\[|\\]$", "", row), " ")[[1]]
+  # Remove any leading/trailing whitespace
+  elements <- trimws(elements)
+  elements <- gsub("'", "", elements) # remove apostrophes
+  # Return vector of parsed elements
+  elements_vec <- as.vector(elements)
+  return(elements_vec)
+}
+
+parse_row_wo_space <- function(row) {
+  # Remove brackets and split by comma
+  elements <- strsplit(row, split = "..",fixed=TRUE)[[1]]
+  elements <- strsplit(gsub("^\\[|\\]$", "", row), ",")[[1]]
+  #elements <- strsplit(gsub("^\\[|\\]$", "", row), " ")[[1]]
+  # Remove any leading/trailing whitespace
+  elements <- trimws(elements)
+  elements <- gsub("'", "", elements) # remove apostrophes
+  elements <- gsub("*", "", elements) # remove apostrophes
+  # Return vector of parsed elements
+  elements_vec <- as.vector(elements)
+  return(elements_vec)
+}
+
+encode_row <- function(vector, weights_df) {
+  # Parse the row to get the elements in the vector
+  for (i in 1:length(vector)) {
+    for (j in 1:length(vector[[i]])) {
+      match_idx <- match(vector[[i]][j], weights_df$word)
+      if (!is.na(match_idx)) {
+        vector[[i]][j] <- weights_df$count[match_idx]
+      }
+      else {
+        vector[[i]][j] <- 0.0
+      }
+    }
+  }
+  return(vector)
+}
+```
+
+
+##### Word sepearation & score
+Use function parse_row & encode_row to separate the words or phrases and assign the counted value to the cell.
+Mechanism explained:
+1. Vectorized the cell value
+- ex) ['ABS', 'Aluminum Wheels', 'AM/FM Stereo'] --> <ABS,Aluminum Wheels,AM/FM Stereo>
+2. Counted each 100 frequent words or phrases
+- ex) ABS had 200 appearances in the data, Aluminum Wheels appeared 100 times, AM/FM Stereo appeared 50 times
+3. Assign each value into the vector
+- ex) <ABS,Aluminum Wheels,AM/FM Stereo> --> <200,100,50>
+4. Sum the vector values
+- ex) <200,100,50> --> 350
+
+word_score function is meant for the training data, which contains the target value 'Vehicle Trim' and 'Price'
+word-score_apply is meant for the testing data.
+```{r}
+#function format <- function(data, c("column_name1","column_name2"), 'word'/'phrase')
+#be sure to use after function 'parse_list', 'parse_row', and 'encode_row' is established
+word_score <- function(df, columns, word_or_phrase, word_token) {
+  for (i in columns) {
+    #create additional dataframe for specific column
+    print(i)
+    temp_df <- df[i]
+    #print(temp_df)
+  #decide if you're going to prioritize a word or a phrase
+    if (word_or_phrase == 'word') {
+      print('word')
+      #change the column name to "text"
+      temp_df <- rename(temp_df, text = colnames(df[i]))
+      #split text into individual words
+      temp_df_words <- temp_df %>% 
+        unnest_tokens(word, text, to_lower = FALSE)
+      #remove stop words (common words like "the", "a", etc.)
+      temp_df_words <- temp_df_words %>% 
+        anti_join(stop_words)
+      #count the frequency of each word
+      word_freq <- temp_df_words %>% 
+        count(word, sort = TRUE)
+      if (i %in% c('SellerCity', 'SellerName')) {
+        top_words <- temp_df_words %>% 
+          count(word, sort = TRUE) %>% 
+          slice(1:2000)
+      }
+      else {
+        #keep the top 100 most frequent words
+        top_words <- temp_df_words %>% 
+          count(word, sort = TRUE) %>% 
+          slice(1:100)
+      }
+      
+      #rename column 'n' as 'count'
+      top_words <- rename(top_words, count = n)
+      #print(top_words)
+      #normalize the count of top words in a range of 0 to 1
+      process <- preProcess(as.data.frame(top_words), method=c("range"))
+      norm_temp_df <- predict(process, as.data.frame(top_words))
+      word_token <<- norm_temp_df
+      #use function parse_row -> going to give vectors with split words ex) "hello world" -> <"hello", "world">
+      temp_df_parsed <- t(apply(temp_df,1, parse_row_w_space))
+    }
+    #difference between word and phrase comes by the method of parsing the words
+    else if (word_or_phrase == 'phrase') {
+      print('phrase')
+      temp_df_list <- temp_df %>% 
+        mutate(parsed = lapply(.[,colnames(df[i])], parse_list)) %>% 
+        #split into each phrase
+        unnest(parsed) %>% 
+        #create a dataframe that has phrase on the left and count of the phrase on the right
+        group_by(word) %>%
+        summarise(count = sum(count)) %>% 
+        #arrange in a descending order
+        arrange(desc(count))
+      #take only the top 100 phrases
+      #top_words_list <- temp_df_list[temp_df_list$count>100,]
+      if (i %in% c('VehSellerNotes')) {
+        top_words_list <- temp_df_list %>% 
+          slice(1:500)
+      }
+      else {
+        #keep the top 100 most frequent words
+        top_words_list <- temp_df_list %>% 
+          slice(1:100)
+      }
+      #normalize the count of top words in a range of 0 to 1
+      top_words_list_normal <- copy(top_words_list)
+      process <- preProcess(as.data.frame(top_words_list_normal), method=c("YeoJohnson","range"))
+      norm_temp_df <- predict(process, as.data.frame(top_words_list_normal))
+      #print(typeof(norm_temp_df))
+      word_token <<- norm_temp_df
+      #use function parse_row -> going to give vectors with split words ex) "hello world" -> <"hello", "world">
+      temp_df_parsed <- t(apply(temp_df,1, parse_row_wo_space))
+    }
+    #use function encode_row -> if "hello" had frequency 30, and "world" had frequency 10 -> <'30','10'>
+    #but instead of 30 and 10, the normalized number(0 ~ 1) would go into the vectors
+    vector_number_temp_df <- t(encode_row(temp_df_parsed,norm_temp_df))
+    #convert into numeric form ex) <'30','10'> into <30,10> and sum the value
+    vector_row_sums <- apply(vector_number_temp_df, 1, function(x) sum(as.numeric(unlist(x))))
+    vector_row_sums_matrix <- matrix(vector_row_sums)
+    df[i] <- vector_row_sums_matrix
+  }
+  return(df)
+}
+```
+
+These two methods were used to preprocess the data
+range: Normalize values so it ranges between 0 and 1
+YeoJohnson: Like BoxCox, but works for negative values.
+
+```{r}
+#function(data, c("column_name1","column_name2"), 'word'/'phrase')
+#be sure to use after function 'parse_list', 'parse_row', and 'encode_row' is established
+word_score_apply <- function(df, columns, word_or_phrase, cat_token) {
+  for (i in columns) {
+    #create additional dataframe for specific column
+    print(i)
+    temp_df <- df[i]
+    #print(temp_df)
+  #decide if you're going to prioritize a word or a phrase
+    if (word_or_phrase == 'word') {
+      print('word')
+      #change the column name to "text"
+      temp_df <- rename(temp_df, text = colnames(df[i]))
+      #normalize the count of top words in a range of 0 to 1
+      process <- preProcess(as.data.frame(cat_token), method=c("range"))
+      norm_temp_df <- predict(process, as.data.frame(cat_token))
+      #use function parse_row -> going to give vectors with split words ex) "hello world" -> <"hello", "world">
+      temp_df_parsed <- t(apply(temp_df,1, parse_row_w_space))
+    }
+    #difference between word and phrase comes by the method of parsing the words
+    else if (word_or_phrase == 'phrase') {
+      print('phrase')
+      #normalize the count of top words in a range of 0 to 1
+      top_words_list_normal <- copy(cat_token)
+      process <- preProcess(as.data.frame(top_words_list_normal), method=c("YeoJohnson","range"))
+      norm_temp_df <- predict(process, as.data.frame(top_words_list_normal))
+      #print(typeof(norm_temp_df))
+      #use function parse_row -> going to give vectors with split words ex) "hello world" -> <"hello", "world">
+      temp_df_parsed <- t(apply(temp_df,1, parse_row_wo_space))
+    }
+    #use function encode_row -> if "hello" had frequency 30, and "world" had frequency 10 -> <'30','10'>
+    #but instead of 30 and 10, the normalized number(0 ~ 1) would go into the vectors
+    vector_number_temp_df <- t(encode_row(temp_df_parsed,norm_temp_df))
+    #convert into numeric form ex) <'30','10'> into <30,10> and sum the value
+    vector_row_sums <- apply(vector_number_temp_df, 1, function(x) sum(as.numeric(unlist(x))))
+    vector_row_sums_matrix <- matrix(vector_row_sums)
+    df[i] <- vector_row_sums_matrix
+  }
+  return(df)
+}
+```
+
+After the function was formed, the training data was filtered.
+
+```{r, include = FALSE}
+word_token <<- data.frame()
+ucd <- word_score(ucd, c("VehColorExt"), 'word',word_token)
+VehColorExt_token <- word_token
+ucd <- word_score(ucd, c("VehEngine"), 'word',word_token)
+VehEngine_token <- word_token
+#ucd_train <- word_score(ucd_train, c("VehColorExt","VehColorInt","VehEngine","SellerCity","SellerName","VehSellerNotes"), 'word')
+ucd <- word_score(ucd, c("VehFeats"), 'phrase')
+VehFeats_token <- word_token
+ucd <- word_score(ucd, c("VehHistory"), 'phrase')
+VehHistory_token <- word_token
+#ucd_train <- ucd_train %>% filter(VehColorExt != 0 , VehColorInt != 0, VehEngine != 0, SellerCity != 0, SellerName != 0, VehSellerNotes != 0)
+ucd <- ucd %>% filter(VehColorExt != 0 , VehEngine != 0)
+ucd <- ucd %>% filter(VehFeats != 0, VehHistory != 0)
+```
+
+Rest of the columns that has categorical values were transformed into factors.
+```{r}
+ucd <- ucd %>% mutate_at(vars(SellerListSrc, VehDriveTrain, VehFuel, VehMake, VehModel, VehPriceLabel, VehTransmission,Vehicle_Trim), factor)
+```
+
+After all the preprocess, I double checked if there were any na values.
+```{r}
+nrows_with_na <- sum(is.na(ucd))
+cat("Number of rows with NA values:", nrows_with_na, "\n")
+```
+
+## Training and Testing
+
+#### Training data
+
+Assign target variable
+```{r}
+ucd_train_price <- select(ucd, -Vehicle_Trim)
+ucd_train_Trim <- select(ucd, -Dealer_Listing_Price)
+```
+
+I used 'caret' package for training. Control is for cross validation method, which has 5 folds. Metric was assigned to base on Area under the curve.
+```{r}
+control <- trainControl(method="cv", number=5)
+metric <- "ROC AUC"
+```
+
+These are the list of models used for training
+Price
+1. lm   2. glm    3. sgd    4. knn    5. svm    6. cart   7. rf   8. et
+
+Trim
+1. knn    2. svm    3. cart   4. rf   5. et
+
+```{r, include = FALSE}
+## Price
+set.seed(100)
+
+# Linear Regression
+Price.lm <- train(Dealer_Listing_Price~., data=ucd_train_price, method="lm", metric=metric, trControl=control)
+# GLM
+Price.glm <- train(Dealer_Listing_Price~., data=ucd_train_price, method="glm", metric=metric, trControl=control)
+# SGD
+Price.sgd <- train(Dealer_Listing_Price~., data=ucd_train_price, method="glmnet", metric=metric, trControl=control)
+# Gaussian NB
+#Price.nb <- train(Dealer_Listing_Price~., data=ucd_train_price, method="nb", metric=metric, trControl=control)
+# kNN
+Price.knn <- train(Dealer_Listing_Price~., data=ucd_train_price, method="knn", metric=metric, trControl=control)
+# SVM
+Price.svm <- train(Dealer_Listing_Price~., data=ucd_train_price, method="svmRadial", metric=metric, trControl=control)
+# Classification and regression trees
+Price.cart <- train(Dealer_Listing_Price~., data=ucd_train_price, method="rpart", metric=metric, trControl=control)
+# Random Forest
+Price.rf <- train(Dealer_Listing_Price~., data=ucd_train_price, method='rf', tuneLength=5, metric=metric, trControl=control)
+# ExtraTree
+Price.et <- train(Dealer_Listing_Price~., data=ucd_train_price, method="ranger", metric=metric, trControl=control)
+```
+
+
+```{r, warning=FALSE}
+## Trim
+
+set.seed(100)
+
+# Linear Regression
+#Trim.lm <- train(Vehicle_Trim~., data=ucd_train_Trim, method="lm", metric=metric, trControl=control)
+# GLM
+#Trim.glm <- train(Vehicle_Trim~., data=ucd_train_Trim, method="glm", metric=metric, trControl=control)
+# SGD
+#Trim.sgd <- train(Vehicle_Trim~., data=ucd_train_Trim, method="glmnet", metric=metric, trControl=control)
+# Gaussian NB
+#Trim.nb <- train(Vehicle_Trim~., data=ucd_train_Trim, method="nb", metric=metric, trControl=control)
+# kNN
+Trim.knn <- train(Vehicle_Trim~., data=ucd_train_Trim, method="knn", metric=metric, trControl=control)
+# SVM
+Trim.svm <- train(Vehicle_Trim~., data=ucd_train_Trim, method="svmRadial", metric=metric, trControl=control)
+# Classification and regression trees
+Trim.cart <- train(Vehicle_Trim~., data=ucd_train_Trim, method="rpart", metric=metric, trControl=control)
+# Random Forest
+Trim.rf <- train(Vehicle_Trim~., data=ucd_train_Trim, method="rf", tuneLength=5, metric=metric, trControl=control)
+# ExtraTree
+Trim.et <- train(Vehicle_Trim~., data=ucd_train_Trim, method="ranger", metric=metric, trControl=control)
+```
+
+
+```{r}
+priceresults <- resamples(list(lm=Price.lm,glm=Price.glm,sgd=Price.sgd,knn=Price.knn,svm=Price.svm,cart=Price.cart,rf=Price.rf,et=Price.et))
+trimresults <- resamples(list(knn=Trim.knn,svm=Trim.svm,cart=Trim.cart,rf=Trim.rf,et=Trim.et))
+summary(priceresults)
+summary(trimresults)
+```
+
+#### Training RMSE, R2 for Price model and Accuracy and Kappa for Trim model
+```{r}
+price_rmse_values <- data.frame(
+  Price_Model = c("lm","glm","sgd","knn","svm","cart","rf","et"),
+  Price_RMSE = c(priceresults$values$`lm~RMSE`,priceresults$values$`glm~RMSE`,priceresults$values$`sgd~RMSE`,priceresults$values$`knn~RMSE`,priceresults$values$`svm~RMSE`,priceresults$values$`cart~RMSE`, priceresults$values$`rf~RMSE`, priceresults$values$`et~RMSE`),
+  Price_R2 = c(priceresults$values$`lm~Rsquared`,priceresults$values$`glm~Rsquared`,priceresults$values$`sgd~Rsquared`,priceresults$values$`knn~Rsquared`,priceresults$values$`svm~Rsquared`,priceresults$values$`cart~Rsquared`, priceresults$values$`rf~Rsquared`, priceresults$values$`et~Rsquared`)
+)
+
+trim_rmse_values <- data.frame(
+  Trim_Model = c("knn","svm","cart","rf","et"),
+  Trim_Accuracy = c(trimresults$values$`knn~Accuracy`,trimresults$values$`svm~Accuracy`,trimresults$values$`cart~Accuracy`, trimresults$values$`rf~Accuracy`, trimresults$values$`et~Accuracy`),
+  Trim_Kappa = c(trimresults$values$`knn~Kappa`,trimresults$values$`svm~Kappa`,trimresults$values$`cart~Kappa`, trimresults$values$`rf~Kappa`, trimresults$values$`et~Kappa`)
+)
+```
+
+```{r, include = FALSE}
+ucd_test <- copy(ucd_validation)
+ucd_test <- word_score_apply(ucd_test, c("VehColorExt"), 'word',VehColorExt_token)
+ucd_test <- word_score_apply(ucd_test, c("VehEngine"), 'word',VehEngine_token)
+ucd_test <- word_score_apply(ucd_test, c("VehFeats"), 'phrase',VehFeats_token)
+ucd_test <- word_score_apply(ucd_test, c("VehHistory"), 'phrase',VehHistory_token)
+ucd_test <- ucd_test %>% mutate_at(vars(SellerListSrc, VehDriveTrain, VehFuel, VehMake, VehModel, VehPriceLabel, VehTransmission), factor)
+```
+
+#### Testing data
+```{r}
+ucd_test2 <- ucd_test
+ucd_test3 <- ucd_test2                                # Duplicate test data set
+# Create a vector of factor column names in ucd_test3
+factor_cols <- names(ucd_test3)[sapply(ucd_test3, is.factor)]
+# Loop over factor columns and replace values not in ucd with NA
+for (col in factor_cols) {
+  ucd_test3[[col]][!(ucd_test3[[col]] %in% unique(ucd[[col]]))] <- NA
+  ucd_test3[is.na(ucd_test)] <- 0
+}
+```
+```{r}
+dim(ucd_test3)
+```
+
+
+#### Prediction
+```{r}
+price_models <- list(Price.lm,Price.glm,Price.sgd,Price.knn,Price.svm,Price.cart,Price.rf,Price.et)
+trim_models <- list(Trim.knn,Trim.svm,Trim.cart,Trim.rf,Trim.et)
+predict_to_dataframe <- function(model, test_data) {
+  predictions <- predict(model, test_data)
+  predictions_df <- as.data.frame(predictions)
+  return(predictions_df)
+}
+price_predictions_list <- lapply(price_models, function(model) {
+  predict_to_dataframe(model, ucd_test3)
+})
+price_predictions <- bind_cols(price_predictions_list)
+trim_predictions_list <- lapply(trim_models, function(model) {
+  predict_to_dataframe(model, ucd_test3)
+})
+trim_predictions <- bind_cols(trim_predictions_list)
+```
+```{r}
+price_predictions
+```
+```{r}
+trim_predictions
+```
+
+#### Choosing model
+
+ExtraTree method was showed good R2 and RMSE value for Price model.
+Random Forest method showed good Accuracy and Kappa value for Trim model
+
+Price
+1. lm   2. glm    3. sgd    4. knn    5. svm    6. cart   7. rf   8. et
+
+Trim
+1. knn    2. svm    3. cart   4. rf   5. et
+
+```{r}
+price_final <- price_predictions$predictions...8
+trim_final <- trim_predictions$predictions...4
+```
+
+```{r}
+price_final <- as.data.frame(price_final)
+trim_final <- as.data.frame(trim_final)
+```
+```{r}
+dim(trim_final)
+```
+
+```{r}
+ucd_validation = read.csv("Test_Dataset.csv")
+list_ID <- ucd_validation[,1]
+list_ID <- as.data.frame(list_ID)
+```
+```{r}
+list_ID <- as.data.frame(list_ID)
+list_ID
+```
+```{r}
+result_submit <-cbind(list_ID,trim_final,price_final)
+```
+
+
